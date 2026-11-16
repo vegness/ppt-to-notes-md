@@ -45,6 +45,84 @@ POINTER = re.compile(
 )
 HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 
+# ---- 内容判据用的正则
+DIVERGE = re.compile(r"顺便说|顺便提|另外|值得一提的是|值得注意的还有|扩展一|引申|题外话|"
+                     r"补充一点|与此相关|顺带|再说一句|进一步说|换个角度")
+METAPHOR = re.compile(r"就像|好比|类似于|相当于|打个比方|可以想象|不妨想|如同|如同是")
+SENT_SPLIT = re.compile(r"[。！？；!?;]")
+TERM = re.compile(r"[A-Za-z][A-Za-z0-9+#\-]{2,}")
+STOP_TERMS = {"ppt", "pptx", "pdf", "typora", "markdown", "png", "jpg", "http", "https", "www"}
+
+
+def is_meta_block(text: str) -> bool:
+    """文首元信息块也是引用块，但它不是解释。"""
+    head = text.strip()
+    return bool(re.match(r"^(源文件|总页数|页码基准|笔记语言|生成时间|语言)", head)) or \
+        ("源文件" in head and "|" in head)
+
+
+def collect_quote_blocks(lines: list[str]) -> list[tuple[int, str, str]]:
+    """把连续的 > 行收成一条解释块，并记住它前面那一行是什么类型。
+
+    prev_kind 是"这条解释有没有锚点"的证据：只有紧跟在原文段落（或图、表、图注）
+    之后，才算它在解释那段内容；跟在标题或另一条解释后面，多半已经跑题。
+    """
+    blocks: list[tuple[int, str, str]] = []
+    prev_kind = "none"
+    in_fence = False
+    i = 0
+    n = len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            prev_kind = "code"
+            i += 1
+            continue
+        if in_fence:
+            i += 1
+            continue
+        if not s:
+            i += 1          # 空行不改变 prev_kind，解释与原文之间允许隔空行
+            continue
+        if s.startswith(">"):
+            start = i
+            buf = []
+            while i < n and lines[i].strip().startswith(">"):
+                buf.append(lines[i].strip().lstrip(">").strip())
+                i += 1
+            blocks.append((start + 1, "\n".join(buf), prev_kind))
+            prev_kind = "quote"
+            continue
+        if HEADING.match(lines[i]):
+            prev_kind = "heading"
+        elif s.startswith("!["):
+            prev_kind = "image"
+        elif s.startswith("|"):
+            prev_kind = "table"
+        elif re.match(r"^[图表]\s*\d+[\.\-]\d+", s):
+            prev_kind = "caption"
+        else:
+            prev_kind = "text"
+        i += 1
+    return blocks
+
+
+def build_section_map(headings: list[tuple[int, str, int]]):
+    """给行号找它所属的二级小节，用于"一节至多一处比喻"。"""
+    marks = [(ln, idx) for idx, (lvl, _t, ln) in enumerate(headings) if lvl <= 2]
+
+    def section_of(line_no: int) -> int:
+        cur = -1
+        for ln, idx in marks:
+            if ln <= line_no:
+                cur = idx
+            else:
+                break
+        return cur
+
+    return section_of
+
 
 def strip_inline_math(line: str) -> str:
     return re.sub(r"\$\$.*?\$\$|\$[^$\n]*\$", "", line)
@@ -53,9 +131,8 @@ def strip_inline_math(line: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("notes_md")
-    ap.add_argument("--slides", default="", help="extract.py 产出的 slides.json，用于长度比")
+    ap.add_argument("--slides", default="", help="extract.py 产出的 slides.json，用于溯源外部概念")
     ap.add_argument("--img-dir", default="")
-    ap.add_argument("--max-ratio", type=float, default=1.30)
     args = ap.parse_args()
 
     md_path = Path(args.notes_md).resolve()
@@ -210,42 +287,82 @@ def main() -> int:
             if f.is_file() and str(stem) in f.name and f.resolve() not in used:
                 add(WARN, "-", "孤儿插图（笔记未引用）：img/%s" % f.name)
 
-    # ---- 配比：解释不该比原文还长
-    # 加绝对量门槛（解释至少 150 字）而不是原文门槛：短笔记里原文只有几十字，
-    # 一条像样的注释就会"超过原文"，那是正常现象，不是加戏。
-    if quote_chars > body_chars * 1.2 and quote_chars > 150:
-        add(WARN, "-", "解释（%d 字）明显多于原文（%d 字）：灰块比白块还长，说明在替课件讲课，不是在作注"
-            % (quote_chars, body_chars))
-
-    # ---- 长度比：总量 = 原文 + 解释
-    ratio_txt = ""
-    total_chars = body_chars + quote_chars
+    # ================= 内容判据（替代字数判据） =================
+    # 加戏不是"写得多"，是"写到了不相关的地方"。所以这里判三件事：
+    #   1) 解释有没有锚点（是否紧跟它解释的那段原文）
+    #   2) 有没有从 A 滑向 B 的路标语
+    #   3) 有没有引入课件从未给过出处的概念
+    # 字数只作统计展示，不参与判定。
+    slides_text = ""
     if args.slides:
         sp = Path(args.slides).resolve()
         if sp.exists():
             data = json.loads(sp.read_text(encoding="utf-8"))
-            src_chars = max(1, int(data.get("total_chars", 0)))
-            if src_chars < 800:
-                # 课件本身字数太少（标题式课件），比例没有意义，不判
-                ratio_txt = "原文 %d 字 + 解释 %d 字 = %d 字 / 课件 %d 字（源过短，跳过比例判定）" \
-                            % (body_chars, quote_chars, total_chars, src_chars)
-            else:
-                ratio = total_chars / src_chars
-                ratio_txt = "原文 %d 字 + 解释 %d 字 = %d 字 / 课件 %d 字 = %.0f%%" \
-                            % (body_chars, quote_chars, total_chars, src_chars, ratio * 100)
-                if ratio > args.max_ratio:
-                    add(FAIL, "-", "总字数占比 %.0f%% 超过上限 %.0f%%，属于加戏，需压缩解释"
-                        % (ratio * 100, args.max_ratio * 100))
+            parts = []
+            for s in data.get("slides", []):
+                parts.append(s.get("title", ""))
+                parts.extend(b.get("text", "") for b in s.get("blocks", []))
+                parts.extend(c for t in s.get("tables", []) for r in t for c in r)
+                parts.append(s.get("notes", ""))
+            slides_text = "\n".join(parts).lower()
+
+    blocks = collect_quote_blocks(lines)
+    section_of = build_section_map(headings)
+    metaphor_seen: dict[int, int] = {}
+
+    for start_ln, text, prev_kind in blocks:
+        if is_meta_block(text):
+            continue
+        # 1) 锚点
+        if prev_kind not in ("text", "image", "caption", "table", "code"):
+            add(WARN, "L%d" % start_ln,
+                "解释没有锚点（前一行是%s）：解释要紧跟在它解释的原文之后"
+                % {"heading": "标题", "quote": "另一条解释", "none": "文件开头", "code": "代码块"}.get(prev_kind, prev_kind))
+        # 2) 发散路标语
+        hit = DIVERGE.search(text)
+        if hit:
+            add(WARN, "L%d" % start_ln,
+                "疑似从 A 滑向 B：「%s」——这类引导语后面通常已经不是本节内容" % hit.group(0))
+        # 3) 比喻：一节至多一处
+        hits = METAPHOR.findall(text)
+        if hits:
+            sec = section_of(start_ln)
+            before = metaphor_seen.get(sec, 0)
+            metaphor_seen[sec] = before + len(hits)
+            if before + len(hits) > 1:
+                add(WARN, "L%d" % start_ln,
+                    "本小节共 %d 处比喻（「%s」等）：一节至多一处，多则喧宾夺主"
+                    % (before + len(hits), hits[0]))
+        # 4) 一条解释只讲一件事
+        sent = len([x for x in SENT_SPLIT.split(text) if x.strip()])
+        if sent > 3:
+            add(WARN, "L%d" % start_ln,
+                "这条解释 %d 句：超过三句说明你想讲的是新知识点，该进正文而不是注里" % sent)
+        # 5) 外部概念：课件没给过出处
+        if slides_text:
+            unknown = [t for t in TERM.findall(text) if t.lower() not in slides_text]
+            unknown = [t for t in unknown if t.lower() not in STOP_TERMS]
+            if unknown:
+                add(WARN, "L%d" % start_ln,
+                    "课件全文未出现这些概念：%s。若属必要前提，请标「（前置知识）」并只写最少部分"
+                    % "、".join(unknown[:4]))
+
+    # ---- 统计（仅展示，不判定）
+    stat_txt = "原文 %d 字 / 解释 %d 字" % (body_chars, quote_chars)
+    if args.slides and slides_text:
+        sp = Path(args.slides).resolve()
+        data = json.loads(sp.read_text(encoding="utf-8"))
+        src_chars = max(1, int(data.get("total_chars", 0)))
+        stat_txt += " / 课件 %d 字（%.0f%%，仅供参考不判定）" % (src_chars, (body_chars + quote_chars) * 100.0 / src_chars)
+    stat_txt += " / 解释 %d 条" % len([b for b in blocks if not is_meta_block(b[1])])
 
     # ================= 输出 =================
     fails = [x for x in issues if x[0] == FAIL]
     warns = [x for x in issues if x[0] == WARN]
     print("=" * 68)
     print("自检：%s" % md_path.name)
-    print("  原文 %d 字 / 解释 %d 字 / 页码 %d 处 / 插图 %d 张 / 标题 %d 个（元信息 %d 字不计）"
-          % (body_chars, quote_chars, cite_count, len(image_lines), len(headings), header_chars))
-    if ratio_txt:
-        print("  " + ratio_txt)
+    print("  " + stat_txt)
+    print("  页码 %d 处 / 插图 %d 张 / 标题 %d 个" % (cite_count, len(image_lines), len(headings)))
     print("=" * 68)
     if not issues:
         print("  全部通过")
